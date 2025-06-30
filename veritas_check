@@ -1,0 +1,219 @@
+#!/bin/bash
+
+# Veritas Cluster Health Check Script (Modular + Email Support)
+# Author: ChatGPT | Updated: 2025-05-22
+
+LOG_FILE="/var/VRTSvcs/log/engine_A.log"
+NOW=$(date +%s)
+TWO_HOURS_AGO=$((NOW - 7200))
+TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+
+# Default mode and email settings
+MODE="all"
+SEND_MAIL=false
+EMAIL_RECIPIENT="admin@example.com"
+
+# Help Menu
+show_help() {
+cat << EOF
+
+Veritas Cluster Health Check Script
+
+Usage:
+  $(basename "$0") [mode] [--mail] [--to=email@example.com]
+
+Modes:
+  all         Run all checks
+  services    Check Veritas services (had, gab, llt, etc.)
+  cluster     Check GAB, LLT, fencing, and cluster state
+  sg          Check service groups and resource states
+  dgs         Check disk group status
+  logs        Check engine_A.log for recent errors
+  -h, --help  Show this help menu
+
+Options:
+  --mail           Enable email sending of the report
+  --to=<email>     Recipient email address
+
+Examples:
+  $0 all --mail --to=infra@example.com
+  $0 logs
+EOF
+}
+
+# Logging
+log_info() { echo "[$TIMESTAMP] INFO: $1"; }
+log_error() { echo "[$TIMESTAMP] ERROR: $1" >&2; }
+
+# Argument parsing
+for arg in "$@"; do
+    case "$arg" in
+        all|services|cluster|sg|dgs|logs) MODE="$arg" ;;
+        --mail) SEND_MAIL=true ;;
+        --to=*) EMAIL_RECIPIENT="${arg#*=}" ;;
+        -h|--help) show_help; exit 0 ;;
+        *) echo "Unknown option: $arg"; show_help; exit 1 ;;
+    esac
+done
+
+# Capture output
+TMP_FILE=$(mktemp /tmp/vcscheck.XXXXXX)
+exec > >(tee "$TMP_FILE") 2>&1
+
+# Check required commands
+check_cmds() {
+    CMDS=("haclus" "hagrp" "hares" "gabconfig" "vxfenadm" "lltstat" "vxdg" "ps" "sendmail" "date" "awk")
+    for cmd in "${CMDS[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "Command '$cmd' is missing."
+            exit 1
+        fi
+    done
+}
+
+# Check Veritas services
+check_services() {
+    log_info "Checking Veritas services..."
+    SERVICES=("had" "hashadow" "llt" "gab" "vxfen" "vxconfigd")
+    for svc in "${SERVICES[@]}"; do
+        if pgrep -x "$svc" > /dev/null; then
+            log_info "Service '$svc' is running."
+        else
+            log_error "Service '$svc' is NOT running."
+        fi
+    done
+}
+
+# Cluster/GAB/LLT check
+check_cluster_core() {
+    log_info "Checking cluster state..."
+    if haclus -display &>/dev/null; then
+        CLUSTER_NAME=$(haclus -display | awk 'NR==2{print $1}')
+        log_info "Cluster '$CLUSTER_NAME' is running."
+    else
+        log_error "Cluster is not running or inaccessible."
+        return
+    fi
+
+    log_info "Checking GAB ports..."
+    if gabconfig -a | grep -q "Port a"; then
+        log_info "GAB Port 'a' is active."
+    else
+        log_error "GAB Port 'a' is NOT active."
+    fi
+
+    log_info "Checking LLT..."
+    if lltstat -nvv | grep -q 'LLT node'; then
+        log_info "LLT is configured and active."
+    else
+        log_error "LLT is NOT running."
+    fi
+
+    log_info "Checking I/O fencing..."
+    if vxfenadm -d &>/dev/null; then
+        log_info "I/O fencing is configured."
+    else
+        log_error "I/O fencing is NOT properly configured."
+    fi
+}
+
+# Service group and resource check
+check_service_groups() {
+    log_info "Checking service group statuses..."
+    hagrp -state | while read -r line; do
+        echo "    $line"
+    done
+
+    log_info "Checking resource states..."
+    FAULTED=$(hares -state | grep -E "FAULTED|OFFLINE")
+    if [ -z "$FAULTED" ]; then
+        log_info "All resources are online and healthy."
+    else
+        log_error "Detected FAULTED or OFFLINE resources:"
+        echo "$FAULTED"
+    fi
+}
+
+# Disk group check
+check_diskgroups() {
+    log_info "Checking Veritas Disk Group (DG) status..."
+    vxdg list | while read -r line; do
+        echo "    $line"
+    done
+}
+
+# engine_A.log error check
+check_engine_log() {
+    log_info "Checking engine_A.log for errors in the past 2 hours..."
+    if [[ -f "$LOG_FILE" ]]; then
+        ERRORS=$(awk -v now="$NOW" -v cutoff="$TWO_HOURS_AGO" '
+            {
+                match($0, /^[A-Za-z]{3} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2}/, ts)
+                if (ts[0] != "") {
+                    cmd = "date -d \"" ts[0] "\" +%s"
+                    cmd | getline t
+                    close(cmd)
+                    if (t >= cutoff && t <= now && $0 ~ /ERROR|CRITICAL|FAULTED/) {
+                        print $0
+                    }
+                }
+            }
+        ' "$LOG_FILE")
+
+        if [ -n "$ERRORS" ]; then
+            log_error "Recent errors in engine_A.log:"
+            echo "$ERRORS"
+        else
+            log_info "No errors found in engine_A.log in the past 2 hours."
+        fi
+    else
+        log_error "Log file not found: $LOG_FILE"
+    fi
+}
+
+# Main execution
+check_cmds
+log_info "Running Veritas Cluster Health Check in mode: $MODE"
+
+case "$MODE" in
+    all)
+        check_services
+        check_cluster_core
+        check_service_groups
+        check_diskgroups
+        check_engine_log
+        ;;
+    services) check_services ;;
+    cluster)  check_cluster_core ;;
+    sg)       check_service_groups ;;
+    dgs)      check_diskgroups ;;
+    logs)     check_engine_log ;;
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    *)
+        log_error "Unknown option or mode: $MODE"
+        show_help
+        exit 1
+        ;;
+
+esac
+
+log_info "Health check for mode '$MODE' completed."
+
+# Send email if requested
+if $SEND_MAIL; then
+    SUBJECT="[VCS Check] Report: $MODE mode on $(hostname)"
+    {
+        echo "To: $EMAIL_RECIPIENT"
+        echo "Subject: $SUBJECT"
+        echo "Content-Type: text/plain"
+        echo
+        cat "$TMP_FILE"
+    } | sendmail -t
+    log_info "Status report emailed to $EMAIL_RECIPIENT."
+fi
+
+# Clean up
+drm -f "$TMP_FILE"
