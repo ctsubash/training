@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Veritas Cluster Health Check Script (Modular + Email Support)
-# Author: ChatGPT | Updated: 2025-05-22
+
 
 LOG_FILE="/var/VRTSvcs/log/engine_A.log"
 NOW=$(date +%s)
